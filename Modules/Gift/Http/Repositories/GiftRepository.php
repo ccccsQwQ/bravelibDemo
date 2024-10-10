@@ -31,12 +31,28 @@ class GiftRepository
 
     /**
      * 赠送幸运礼物(按组赠送礼物)
+     * 并发场景下崩溃和卡顿原因：
+     * 假设出现A送B,同时B送A的场景
+     * A请求执行到查询coin并加锁
+     * 此时B请求也恰好执行到查询coin并加锁
+     * 接着A请求执行到增加B用户coin，此时B请求已经把数据锁住，因此A请求在此停顿等待B请求解锁
+     * 此时B请求执行到增加A用户coin，同上，B请求需要等待A请求解锁
+     * 这情况下，A等B解锁，B等A解锁，形成死锁，在并发场景下这个情况可能会出现多次，导致资源紧张直到崩溃
+     * 解决思路：避免死锁，延迟update操作，在业务上做调整，通知用户coin到账可能会有延迟
      * @throws Throwable
      */
     public function doGiveGroupGift($uid, $to_uid, $giftInfo, $scene, $room_id, $number_group, $eachUserGiftCoin, $giftUnitCoin)
     {
         try {
             return DB::transaction(function () use ($room_id, $uid, $to_uid, $giftInfo, $scene, $number_group, $eachUserGiftCoin, $giftUnitCoin) {
+                // 解决办法三：
+                // coin字段设置为非负，此处不需要上锁只需要判断余额是否充足，当并发场景导致验证异常执时，
+                // coin不足导致coin值为负数时数据库抛出异常，在下方catch处根据业务做对应处理
+                // 解决办法四（不建议）：
+                // 把uid和coin读到redis
+                // 校验coin通过读redis完成，update执行时写入数据库后同步到redis
+                // redis上锁不会影响到后续的数据库update
+                // 但是会出现高并发场景下的数据库和缓存数据不一致问题，可以通过缓存双删来缓解，没法根除
                 # 赠送礼物：为防止高并发跳过校验，加锁
                 $userCoinBalance = User::query()->where(['id' => $uid])->lockForUpdate()->value('coin');
                 if ($userCoinBalance < $eachUserGiftCoin) {
@@ -66,6 +82,11 @@ class GiftRepository
                 $multipleNum = 100;//通过一定算法计算该礼物会返回给赠送者N倍的礼物价值;
                 $backCoin    = bcmul($multipleNum, $giftUnitCoin, 8);
                 if ($backCoin > 0) {
+                    // 解决办法一：
+                    // 此处不直接处理coin增加，可以选择通过队列增加coin
+                    // UserCoinQueueService::IncreCoinByUid($to_uid, $backCoin);
+                    // 解决办法二：
+                    // 此处不直接处理coin增加，通过定时任务扫bill表，读间隔时间段内新增的数据后更新User表的coin
                     User::query()->where('id', $to_uid)->increment('coin', $backCoin);
                     $userCoinBalance = floatval($userCoinBalance) + floatval($backCoin);
                     $bill            = [
